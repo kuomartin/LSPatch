@@ -1,5 +1,8 @@
 package org.lsposed.lspatch.loader;
 
+import android.accounts.Account;
+import android.accounts.AccountManager;
+import android.accounts.AuthenticatorDescription;
 import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -30,6 +33,9 @@ import de.robv.android.xposed.XposedHelpers;
  * rewritten too. Upstream microG is not a target: it installs as Google Play services itself, so nothing needs
  * redirecting, and the patcher's C2DM rename is MicroG RE's.
  *
+ * MicroG RE also registers its accounts under its own type rather than {@code com.google}, so an auth token asked of
+ * the account manager for a Google account is asked of MicroG RE's account of the same name instead.
+ *
  * An intent the app addresses to itself is never rewritten: the Google sign-in library opens its own
  * {@code SignInHubActivity} with {@code com.google.android.gms.auth.GOOGLE_SIGN_IN}, and that activity finishes on any
  * other action.
@@ -38,11 +44,16 @@ public class GmsRedirector {
     private static final String TAG = "LSPatch-GmsRedirect";
     private static final String REAL_GMS = Constants.REAL_GMS_PACKAGE_NAME;
 
+    private static final String GOOGLE_ACCOUNT_TYPE = "com.google";
+
     private static String targetGms = null;
     private static String selfPackage = null;
+    private static Context appContext = null;
+    private static volatile String targetAccountType = null;
 
     public static void activate(Context context) {
         selfPackage = context.getPackageName();
+        appContext = context;
 
         if (!isInstalled(context, Constants.MICROG_RE_PACKAGE_NAME)) {
             Log.w(TAG, "MicroG RE is not installed or not visible to the app (add QUERY_ALL_PACKAGES), GMS redirect disabled");
@@ -61,6 +72,7 @@ public class GmsRedirector {
         hookIntentResolve();
         hookActivityStart();
         hookContentResolverAcquire();
+        hookAccountManagerAuthToken();
 
         Log.i(TAG, "GMS redirect hooks installed");
     }
@@ -441,6 +453,46 @@ public class GmsRedirector {
             });
         } catch (Throwable t) {
             Log.e(TAG, "Failed to hook ContentResolver", t);
+        }
+    }
+
+    /** The account type MicroG RE's authenticator registers, or null if none is registered. */
+    private static String targetAccountType() {
+        String type = targetAccountType;
+        if (type != null) return type;
+        for (AuthenticatorDescription description : AccountManager.get(appContext).getAuthenticatorTypes()) {
+            if (targetGms.equals(description.packageName)) {
+                targetAccountType = description.type;
+                return description.type;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A Google account picked from the system account picker -- where {@code CHOOSE_ACCOUNT} is routed -- has type
+     * {@code com.google}, and the account manager hands its token requests to Google Play services, which refuses the
+     * re-signed app. Every {@code getAuthToken} overload and {@code blockingGetAuthToken} take the account first.
+     */
+    private static void hookAccountManagerAuthToken() {
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (!(param.args[0] instanceof Account)) return;
+                Account account = (Account) param.args[0];
+                if (!GOOGLE_ACCOUNT_TYPE.equals(account.type)) return;
+                String type = targetAccountType();
+                if (type == null) return;
+                XLog.d(TAG, "Asking MicroG RE account type " + type + " for an auth token");
+                param.args[0] = new Account(account.name, type);
+            }
+        };
+        for (String method : new String[]{"getAuthToken", "blockingGetAuthToken"}) {
+            try {
+                XposedBridge.hookAllMethods(AccountManager.class, method, hook);
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to hook AccountManager." + method, t);
+            }
         }
     }
 }
