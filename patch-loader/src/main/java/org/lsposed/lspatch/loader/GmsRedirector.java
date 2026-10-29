@@ -1,5 +1,8 @@
 package org.lsposed.lspatch.loader;
 
+import android.accounts.Account;
+import android.accounts.AccountManager;
+import android.accounts.AuthenticatorDescription;
 import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -7,6 +10,9 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.util.Log;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.lsposed.lspatch.loader.util.XLog;
 import org.lsposed.lspatch.share.Constants;
@@ -24,24 +30,26 @@ import de.robv.android.xposed.XposedHelpers;
  * call, to it. Which certificate that build then reports for the app is decided by the manifest metadata the
  * patcher wrote, not here.
  *
- * Actions are deliberately left alone. A replacement is a drop-in: it declares Google's own action names under its
- * own package, so rewriting the package is what routes a call, and rewriting the action as well would address a
- * name nothing declares. Push is the one exception, for the reason given on {@link #redirectAction}.
+ * Actions follow what the replacement declares. One that kept Google's names answers Google's actions, so only its
+ * package is rewritten. One that renamed its namespaces declares most actions only under its own name and a few only
+ * under Google's, so each action is rewritten exactly when the renamed one resolves in it; see {@link #redirectAction}.
  *
  * Nothing else is assumed about the build. Two kinds exist -- one that renamed Google's namespaces into its own so
  * it can sit beside Google Play services, and one that keeps Google's names because it is meant to replace it
  * outright -- and only the first needs its authorities and push names rewritten. That question is answered from the
  * package name alone, by {@link Constants#renamesGoogleNamespaces}, so no vendor is named here.
  *
- * An intent the app addresses to itself is never rewritten: only Google's own package and {@code gsf} are matched,
- * which matters because the sign-in library opens its own {@code SignInHubActivity} with Google's
- * {@code GOOGLE_SIGN_IN} action, and that activity finishes on any other action.
+ * An intent the app addresses to itself keeps Google's action names: the sign-in library opens its own
+ * {@code SignInHubActivity} with Google's {@code GOOGLE_SIGN_IN} action, and that activity finishes on any other
+ * action. Only Google's own package and {@code gsf} are matched for packages, so its package is never touched either.
  */
 public class GmsRedirector {
     private static final String TAG = "LSPatch-GmsRedirect";
     private static final String REAL_GMS = Constants.REAL_GMS_PACKAGE_NAME;
 
     private static String targetGms = null;
+    private static String selfPackage = null;
+    private static PackageManager packageManager = null;
 
     /**
      * Points the app at [gmsReplacementPackage], if that build is installed and the app can see it.
@@ -61,9 +69,12 @@ public class GmsRedirector {
             return;
         }
         targetGms = gmsReplacementPackage;
+        selfPackage = context.getPackageName();
+        packageManager = context.getPackageManager();
 
         Log.i(TAG, "Activating GMS redirect: " + REAL_GMS + " -> " + targetGms);
         setupC2dmRedirects();
+        setupActionRedirects();
 
         hookIntentSetPackage();
         hookIntentSetAction();
@@ -72,7 +83,9 @@ public class GmsRedirector {
         hookIntentSetClass();
         hookIntentResolve();
         hookActivityStart();
+        hookEgress();
         hookContentResolverAcquire();
+        hookAuthTokens();
 
         Log.i(TAG, "GMS redirect hooks installed");
     }
@@ -237,27 +250,113 @@ public class GmsRedirector {
         }
     }
 
+    private static final String GMS_ACTION_PREFIX = REAL_GMS + ".";
+
     /**
-     * The action to use in place of [action], or null to leave it alone, which is the usual answer.
+     * The namespace a replacement that renamed its own declares Google Play services actions in, or null when it
+     * kept Google's and answers Google's names as they are.
+     */
+    private static String gmsActionPrefix = null;
+
+    /** Whether each renamed action resolves in the replacement, asked once per action. */
+    private static final Map<String, Boolean> declaredActions = new ConcurrentHashMap<>();
+
+    /** Set while {@link #declares} asks the package manager, so nothing it builds on the way asks again. */
+    private static final ThreadLocal<Boolean> querying = new ThreadLocal<>();
+
+    private static void setupActionRedirects() {
+        gmsActionPrefix = Constants.renamesGoogleNamespaces(targetGms) ? targetGms + "." : null;
+        if (gmsActionPrefix != null) {
+            Log.i(TAG, "GMS actions rewritten to " + gmsActionPrefix + "* where " + targetGms + " declares them");
+        }
+    }
+
+    /**
+     * The action to use in place of [action], or null to leave it alone.
      *
-     * Only the C2DM family is rewritten. A replacement is a drop-in: it answers Google's own action names under
-     * its own package, so rewriting the package is what routes a call to it and rewriting the action as well
-     * would send that call to a name nothing declares. Push is the exception, and only because the receiving
-     * side cannot be reached under Google's names at all -- the permission guarding them is a signature
-     * permission of Google Play services that no other build can hold -- which is why the patcher renames the
-     * app's own C2DM names in the manifest to match.
+     * Push names are rewritten wholesale, because the receiving side cannot be reached under Google's names at
+     * all -- the permission guarding them is a signature permission of Google Play services that no other build
+     * can hold -- which is why the patcher renames the app's own C2DM names in the manifest to match.
+     *
+     * Every other Google Play services action is rewritten into the replacement's namespace only when the
+     * replacement declares it there. A replacement that renamed its namespaces declares most actions only under
+     * its own name (sign-in among them) and a few only under Google's, so neither leaving them all nor renaming
+     * them all reaches it; asking it is the only rule that holds for every build. CHOOSE_ACCOUNT is left to the
+     * system account picker.
      */
     static String redirectAction(String action) {
-        if (action == null || c2dmPrefix == null) return null;
-        if (!action.startsWith(Constants.GOOGLE_C2DM_PREFIX)) return null;
-        return c2dmPrefix + action.substring(Constants.GOOGLE_C2DM_PREFIX.length());
+        if (action == null) return null;
+        if (c2dmPrefix != null && action.startsWith(Constants.GOOGLE_C2DM_PREFIX)) {
+            return c2dmPrefix + action.substring(Constants.GOOGLE_C2DM_PREFIX.length());
+        }
+        if (gmsActionPrefix == null || !action.startsWith(GMS_ACTION_PREFIX) || isChooseAccountAction(action)) {
+            return null;
+        }
+        String renamed = gmsActionPrefix + action.substring(GMS_ACTION_PREFIX.length());
+        return declares(renamed) ? renamed : null;
     }
 
     /** The Google name for [action] if this rewrote it on the way out, or null when it is not one of ours. */
     static String restoreAction(String action) {
-        if (action == null || c2dmPrefix == null) return null;
-        if (!action.startsWith(c2dmPrefix)) return null;
-        return Constants.GOOGLE_C2DM_PREFIX + action.substring(c2dmPrefix.length());
+        if (action == null) return null;
+        if (c2dmPrefix != null && action.startsWith(c2dmPrefix)) {
+            return Constants.GOOGLE_C2DM_PREFIX + action.substring(c2dmPrefix.length());
+        }
+        return restoreGmsAction(action);
+    }
+
+    /** The Google name for a Google Play services [action] this renamed, or null when it renamed no such action. */
+    private static String restoreGmsAction(String action) {
+        if (action == null || gmsActionPrefix == null || !action.startsWith(gmsActionPrefix)) return null;
+        if (!Boolean.TRUE.equals(declaredActions.get(action))) return null;
+        return GMS_ACTION_PREFIX + action.substring(gmsActionPrefix.length());
+    }
+
+    /**
+     * Whether [action] resolves to an activity, service or receiver of the replacement.
+     *
+     * A failed query counts as not declared, which leaves Google's name in place as a replacement that kept
+     * Google's names would want.
+     */
+    private static boolean declares(String action) {
+        Boolean known = declaredActions.get(action);
+        if (known != null) return known;
+        if (Boolean.TRUE.equals(querying.get())) return false;
+        querying.set(true);
+        boolean found;
+        try {
+            Intent query = new Intent(action).setPackage(targetGms);
+            found = !packageManager.queryIntentActivities(query, 0).isEmpty()
+                    || !packageManager.queryIntentServices(query, 0).isEmpty()
+                    || !packageManager.queryBroadcastReceivers(query, 0).isEmpty();
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to ask " + targetGms + " for " + action, t);
+            found = false;
+        } finally {
+            querying.set(false);
+        }
+        declaredActions.put(action, found);
+        XLog.d(TAG, action + (found ? " is" : " is not") + " declared by " + targetGms);
+        return found;
+    }
+
+    private static boolean isSelfTargeted(Intent intent) {
+        if (selfPackage == null) return false;
+        ComponentName cn = intent.getComponent();
+        return selfPackage.equals(intent.getPackage()) || (cn != null && selfPackage.equals(cn.getPackageName()));
+    }
+
+    /**
+     * Puts Google's action name back on an intent the app turns out to address to itself.
+     *
+     * The action is often set before the target, as in {@code new Intent(action).setClass(...)}, so it has
+     * already been renamed by the time the target is known. Written to the field so the setter hook does not
+     * rename it again.
+     */
+    private static void keepSelfAction(Intent intent) {
+        if (gmsActionPrefix == null || !isSelfTargeted(intent)) return;
+        String original = restoreGmsAction((String) XposedHelpers.getObjectField(intent, "mAction"));
+        if (original != null) XposedHelpers.setObjectField(intent, "mAction", original);
     }
 
     private static void hookIntentSetPackage() {
@@ -282,6 +381,7 @@ public class GmsRedirector {
                 protected void afterHookedMethod(MethodHookParam param) {
                     Intent intent = (Intent) param.thisObject;
                     routeChooseAccountToSystem(intent);
+                    keepSelfAction(intent);
                 }
             });
         } catch (Throwable t) {
@@ -305,7 +405,9 @@ public class GmsRedirector {
 
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    routeChooseAccountToSystem((Intent) param.thisObject);
+                    Intent intent = (Intent) param.thisObject;
+                    routeChooseAccountToSystem(intent);
+                    keepSelfAction(intent);
                 }
             });
         } catch (Throwable t) {
@@ -347,6 +449,7 @@ public class GmsRedirector {
                 protected void afterHookedMethod(MethodHookParam param) {
                     Intent intent = (Intent) param.thisObject;
                     routeChooseAccountToSystem(intent);
+                    keepSelfAction(intent);
                 }
             });
         } catch (Throwable t) {
@@ -357,25 +460,28 @@ public class GmsRedirector {
     /**
      * {@code setClass}, {@code setClassName} and {@code readFromParcel} assign the component without going through
      * {@code setComponent}, so the rewrite there never sees them and the component would keep pointing at Google's
-     * package. {@code readFromParcel} is how an activity's own launch intent arrives.
+     * package. {@code readFromParcel} is how an activity's own launch intent arrives; its action is the sender's,
+     * so only the setters restore the app's own action names.
      */
     private static void hookIntentSetClass() {
-        XC_MethodHook hook = new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
-                Intent intent = (Intent) param.thisObject;
-                ComponentName cn = intent.getComponent();
-                if (cn == null) return;
-                String redirected = redirectPackage(cn.getPackageName());
-                if (redirected != null) {
-                    XLog.d(TAG, "Redirecting component from " + cn.getClassName() + "'s package");
-                    XposedHelpers.setObjectField(intent, "mComponent", new ComponentName(redirected, cn.getClassName()));
-                }
-            }
-        };
         for (String method : new String[]{"setClass", "setClassName", "readFromParcel"}) {
+            boolean outgoing = !method.equals("readFromParcel");
             try {
-                XposedBridge.hookAllMethods(Intent.class, method, hook);
+                XposedBridge.hookAllMethods(Intent.class, method, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        Intent intent = (Intent) param.thisObject;
+                        if (outgoing) keepSelfAction(intent);
+                        ComponentName cn = intent.getComponent();
+                        if (cn == null) return;
+                        String redirected = redirectPackage(cn.getPackageName());
+                        if (redirected != null) {
+                            XLog.d(TAG, "Redirecting component from " + cn.getClassName() + "'s package");
+                            XposedHelpers.setObjectField(intent, "mComponent",
+                                    new ComponentName(redirected, cn.getClassName()));
+                        }
+                    }
+                });
             } catch (Throwable t) {
                 Log.e(TAG, "Failed to hook Intent." + method, t);
             }
@@ -410,6 +516,7 @@ public class GmsRedirector {
                         }
                     }
                     routeChooseAccountToSystem(intent);
+                    keepSelfAction(intent);
                 }
             });
         } catch (Throwable t) {
@@ -441,6 +548,143 @@ public class GmsRedirector {
         } catch (Throwable t) {
             Log.e(TAG, "Failed to hook startActivity/startActivityForResult", t);
         }
+    }
+
+    private static final String CHIMERA_BOUND_SERVICE = "com.google.android.chimera.BoundService.START";
+    private static final String CHIMERA_SCHEME = "chimera-action";
+
+    /**
+     * Rewrites every intent the framework is about to send, by field, applying all the rules at once.
+     *
+     * The setter hooks miss an intent whose constructor and setters were inlined into the app's own code by AOT
+     * compilation, so the identity and phenotype bindings of such an app would still reach Google Play services.
+     * {@code bindService}, {@code startService} and {@code startActivity} all end up here.
+     *
+     * This is also the only place a chimera binding can be seen whole. A recent client library asks Google Play
+     * services' chimera provider for the component implementing an API, then binds that component directly with
+     * {@code BoundService.START} and the API's own action carried as {@code chimera-action:<action>}. A replacement
+     * has no such components, so the binding is turned back into the API's own action, addressed to the
+     * replacement's package.
+     */
+    private static void hookEgress() {
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (param.args == null) return;
+                for (Object arg : param.args) {
+                    if (arg instanceof Intent) {
+                        redirectOnEgress((Intent) arg);
+                    } else if (arg instanceof Intent[]) {
+                        for (Intent intent : (Intent[]) arg) {
+                            if (intent != null) redirectOnEgress(intent);
+                        }
+                    }
+                }
+            }
+        };
+        try {
+            Class<?> contextImpl = Class.forName("android.app.ContextImpl");
+            XposedBridge.hookAllMethods(contextImpl, "bindServiceCommon", hook);
+            XposedBridge.hookAllMethods(contextImpl, "startServiceCommon", hook);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to hook ContextImpl service calls", t);
+        }
+        try {
+            XposedBridge.hookAllMethods(android.app.Instrumentation.class, "execStartActivity", hook);
+            XposedBridge.hookAllMethods(android.app.Instrumentation.class, "execStartActivities", hook);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to hook Instrumentation.execStartActivity", t);
+        }
+    }
+
+    private static void redirectOnEgress(Intent intent) {
+        unwrapChimera(intent);
+        ComponentName cn = intent.getComponent();
+        if (cn != null) {
+            String redirected = redirectPackage(cn.getPackageName());
+            if (redirected != null) {
+                XposedHelpers.setObjectField(intent, "mComponent", new ComponentName(redirected, cn.getClassName()));
+            }
+        }
+        String pkg = redirectPackage(intent.getPackage());
+        if (pkg != null) XposedHelpers.setObjectField(intent, "mPackage", pkg);
+        // Read from the field: getAction answers with Google's name for an action this already rewrote.
+        String action = (String) XposedHelpers.getObjectField(intent, "mAction");
+        if (!isSelfTargeted(intent)) {
+            String redirected = redirectAction(action);
+            if (redirected != null) {
+                XLog.d(TAG, "Redirecting action on egress: " + action + " -> " + redirected);
+                XposedHelpers.setObjectField(intent, "mAction", redirected);
+            }
+        } else {
+            keepSelfAction(intent);
+        }
+        routeChooseAccountToSystem(intent);
+    }
+
+    private static void unwrapChimera(Intent intent) {
+        if (!CHIMERA_BOUND_SERVICE.equals(XposedHelpers.getObjectField(intent, "mAction"))) return;
+        ComponentName cn = intent.getComponent();
+        if (cn == null || !(REAL_GMS.equals(cn.getPackageName()) || targetGms.equals(cn.getPackageName()))) return;
+        Uri data = intent.getData();
+        if (data == null || !CHIMERA_SCHEME.equals(data.getScheme())) return;
+        String action = data.getSchemeSpecificPart();
+        if (action == null || action.isEmpty()) return;
+        XLog.d(TAG, "Unwrapping chimera binding of " + cn.getClassName() + " to " + action);
+        XposedHelpers.setObjectField(intent, "mAction", action);
+        XposedHelpers.setObjectField(intent, "mData", null);
+        XposedHelpers.setObjectField(intent, "mComponent", null);
+        XposedHelpers.setObjectField(intent, "mPackage", targetGms);
+    }
+
+    private static final String GOOGLE_ACCOUNT_TYPE = "com.google";
+
+    /** The account type the replacement's authenticator registered, once found. */
+    private static volatile String targetAccountType = null;
+
+    /**
+     * Asks the replacement's account of the same name for auth tokens the app requests for a Google account.
+     *
+     * After sign-in, a client such as Cordova's Google sign-in plugin asks {@code AccountManager.getAuthToken}
+     * for a token on the {@code com.google} account. That goes to Google Play services' authenticator, which
+     * checks the caller's certificate and answers {@code UNREGISTERED_ON_API_CONSOLE}, so sign-in fails after it
+     * has succeeded. A replacement that renamed its namespaces registers its authenticator under an account type
+     * of its own and reports the original certificate, so the account is retyped to that one. A replacement that
+     * registers none is left alone. Every {@code getAuthToken} overload, and {@code blockingGetAuthToken}, takes the
+     * account first.
+     */
+    private static void hookAuthTokens() {
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (param.args.length == 0 || !(param.args[0] instanceof Account)) return;
+                Account account = (Account) param.args[0];
+                if (!GOOGLE_ACCOUNT_TYPE.equals(account.type)) return;
+                String type = targetAccountType((AccountManager) param.thisObject);
+                if (type == null) return;
+                XLog.d(TAG, "Asking " + targetGms + "'s " + type + " account for an auth token");
+                param.args[0] = new Account(account.name, type);
+            }
+        };
+        for (String method : new String[]{"getAuthToken", "blockingGetAuthToken"}) {
+            try {
+                XposedBridge.hookAllMethods(AccountManager.class, method, hook);
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to hook AccountManager." + method, t);
+            }
+        }
+    }
+
+    private static String targetAccountType(AccountManager accountManager) {
+        String type = targetAccountType;
+        if (type != null) return type;
+        for (AuthenticatorDescription authenticator : accountManager.getAuthenticatorTypes()) {
+            if (targetGms.equals(authenticator.packageName)) {
+                targetAccountType = authenticator.type;
+                return authenticator.type;
+            }
+        }
+        return null;
     }
 
     private static void hookContentResolverAcquire() {
